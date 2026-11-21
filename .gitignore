@@ -1,0 +1,4 @@
+node_modules/
+*.tgz
+render.log
+.DS_Store

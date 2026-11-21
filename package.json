@@ -1,0 +1,55 @@
+{
+  "name": "dsh-statusline",
+  "version": "0.1.0",
+  "description": "DSH 底部状态条：当前会话的分支、worktree、工作目录、未提交改动、ahead/behind 与上下文占用。A bottom status line for DeepSeek Harness.",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "dsh",
+    "statusline",
+    "git"
+  ],
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "plugin": {
+      "schemaVersion": 1,
+      "displayName": {
+        "en": "Status Line",
+        "zh-CN": "底部状态条"
+      },
+      "summary": {
+        "en": "Git branch, worktree, cwd, dirty state, ahead/behind and context usage in one line at the bottom of the window.",
+        "zh-CN": "把分支、工作树、工作目录、未提交改动、ahead/behind 与上下文占用压成窗口底部一行。"
+      },
+      "category": "ui"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-api-session-controller"
+      ]
+    }
+  }
+}
