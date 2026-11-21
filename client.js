@@ -58,20 +58,9 @@ window.__ModuleLoader__.load({
         overflow: "hidden",
         textOverflow: "ellipsis",
       },
-      valueMuted: {
-        color: "var(--dsw-alias-label-secondary, #8b8f96)",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
-      },
       separator: {
         opacity: "0.35",
         padding: "0 8px",
-      },
-      accent: {
-        color: "var(--dsw-alias-label-primary, #d4d6da)",
-      },
-      warn: {
-        color: "var(--dsw-static-neutral-bluish-400, #7aa2f7)",
       },
     };
 
@@ -333,7 +322,7 @@ window.__ModuleLoader__.load({
       // Everything is left aligned: branch · worktree · cwd · changes [· ↑a↓b]
       const parts = [];
       parts.push(
-        segment("branch", "branch", branchText, inRepo ? STYLES.value : STYLES.valueMuted, branchTitle),
+        segment("branch", "branch", branchText, STYLES.value, branchTitle),
       );
       // The worktree segment is always present and names the checkout directory;
       // the repository path sits in the tooltip.
@@ -342,9 +331,9 @@ window.__ModuleLoader__.load({
         failureTitle ??
         (!ready ? "…" : inRepo ? String(git.top ?? "") : "not a git repository");
       parts.push(
-        segment("worktree", "worktree", worktreeText, inRepo ? STYLES.value : STYLES.valueMuted, worktreeTitle),
+        segment("worktree", "worktree", worktreeText, STYLES.value, worktreeTitle),
       );
-      parts.push(segment("cwd", "cwd", lastSegment(cwd), STYLES.valueMuted, cwd));
+      parts.push(segment("cwd", "cwd", lastSegment(cwd), STYLES.value, cwd));
 
       {
         // The changes segment always occupies its slot: 0 when clean, *modified
@@ -386,7 +375,7 @@ window.__ModuleLoader__.load({
           jsx(
             "span",
             {
-              style: { ...(changed ? STYLES.warn : STYLES.valueMuted), flexShrink: 0, whiteSpace: "nowrap" },
+              style: { ...STYLES.value, flexShrink: 0, whiteSpace: "nowrap" },
               title: changesTitle,
               children: "changes " + changesText,
             },
@@ -405,7 +394,7 @@ window.__ModuleLoader__.load({
           jsx(
             "span",
             {
-              style: { ...STYLES.accent, flexShrink: 0, whiteSpace: "nowrap" },
+              style: { ...STYLES.value, flexShrink: 0, whiteSpace: "nowrap" },
               title: abTitle,
               "aria-label": abTitle,
               children: ab.join(" "),
