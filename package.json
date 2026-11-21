@@ -1,6 +1,6 @@
 {
   "name": "dsh-statusline",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "A bottom status line for DeepSeek Harness: git branch, worktree, working directory, modified / added / untracked / deleted counts and ahead/behind.",
   "type": "module",
   "main": "index.js",
