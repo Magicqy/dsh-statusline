@@ -372,15 +372,10 @@ window.__ModuleLoader__.load({
                   (git.files === 1 ? " path" : " paths")
                 : "not a git repository");
         parts.push(
-          jsx(
-            "span",
-            {
-              style: { ...STYLES.value, flexShrink: 0, whiteSpace: "nowrap" },
-              title: changesTitle,
-              children: "changes " + changesText,
-            },
-            "changes",
-          ),
+          segment("changes", "changes", changesText, STYLES.value, changesTitle, {
+            flexShrink: 0,
+            whiteSpace: "nowrap",
+          }),
         );
       }
       if (inRepo && (git.ahead > 0 || git.behind > 0)) {
