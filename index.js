@@ -1,36 +1,57 @@
-// DSH statusline 的 Host half：在 Host 侧执行只读 git 命令，并通过
-// Connection 的精确 Fetch 路由把结果交给浏览器半侧。
-// 这里只用 Node 内置模块，保证插件以文件 URL 形式加载时没有任何解析依赖。
+// DSH statusline Host half: runs read-only git commands on the Host and hands
+// the result to the browser half through an exact Fetch route on Connection.
+// Only Node built-ins are used, so the plugin loads from a file URL with no
+// resolution dependencies of its own.
 import { execFile } from "node:child_process";
-import { appendFileSync } from "node:fs";
+import { appendFileSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, normalize } from "node:path";
 import { tmpdir } from "node:os";
 
 /**
- * 渲染自检：只有显式设置 DSH_STATUSLINE_REPORT=1 时才写日志，
- * 并写到系统临时目录——安装目录归包管理器管，插件不往里写运行时文件。
+ * Render self-check: the log is written only when DSH_STATUSLINE_REPORT=1 is set
+ * explicitly, and it goes to the OS temp directory — the install directory
+ * belongs to the package manager, so the plugin writes no runtime files there.
  */
 const REPORT_ENABLED = process.env.DSH_STATUSLINE_REPORT === "1";
 const REPORT_PATH = REPORT_ENABLED ? join(tmpdir(), "dsh-statusline-render.log") : null;
+/** Cap the self-check log so a long-running session cannot grow it without bound. */
+const REPORT_MAX_BYTES = 1024 * 1024;
+
+/**
+ * Whether the self-check log still has room.
+ * @returns {boolean}
+ */
+function reportLogHasRoom() {
+  if (REPORT_PATH === null) return false;
+  try {
+    return statSync(REPORT_PATH).size < REPORT_MAX_BYTES;
+  } catch {
+    return true;
+  }
+}
 
 export const name = "statusline";
 
-/** 只等待 Connection 服务就绪；git 通过 node:child_process 直接执行。 */
+/** Only wait for the Connection service; git runs through node:child_process directly. */
 export const inject = ["connection"];
 
-/** 同一工作目录在短时间内的重复查询复用结果，避免多窗口/多轮询打爆 git。 */
+/** Reuse a working directory's result briefly so several windows/polls cannot hammer git. */
 const CACHE_TTL_MS = 800;
-/** 单条 git 命令的上限。状态条不是阻塞路径，超时就退回“无仓库信息”。 */
+/** Upper bound for one git command. The status line is not a blocking path, so it degrades to "no repository info". */
 const GIT_TIMEOUT_MS = 5000;
 
 /** cwd -> { at, value } */
 const cache = new Map();
+/** cwd -> in-flight collection, so two windows cannot run the same commands twice. */
+const pending = new Map();
 
 /**
- * 执行一条只读 git 命令。
- * @param {string} cwd - 命令工作目录。
- * @param {string[]} args - 子命令与其参数。
- * @returns {Promise<string|null>} 去掉首尾空白的标准输出；失败或超时返回 null。
+ * Run one read-only git command.
+ * @param {string} cwd - working directory for the command.
+ * @param {string[]} args - subcommand and its arguments.
+ * @returns {Promise<{ stdout: string|null, failure: string|null }>} trimmed stdout, or
+ *   why it failed: `git-missing` (not on PATH), `git-timeout` (killed after the limit),
+ *   `git-failed` (anything else, including "not a repository").
  */
 function git(cwd, args) {
   return new Promise((resolve) => {
@@ -40,25 +61,34 @@ function git(cwd, args) {
       {
         timeout: GIT_TIMEOUT_MS,
         windowsHide: true,
-        maxBuffer: 4 * 1024 * 1024,
+        maxBuffer: 32 * 1024 * 1024,
         encoding: "utf8",
       },
       (error, stdout) => {
-        if (error) resolve(null);
-        else resolve(String(stdout).replace(/\s+$/, ""));
+        if (!error) {
+          resolve({ stdout: String(stdout).replace(/\s+$/, ""), failure: null });
+          return;
+        }
+        const failure =
+          error.code === "ENOENT"
+            ? "git-missing"
+            : error.killed === true || typeof error.signal === "string"
+              ? "git-timeout"
+              : "git-failed";
+        resolve({ stdout: null, failure });
       },
     );
   });
 }
 
 /**
- * 解析 `status --porcelain=v2 --branch` 的输出，按修改/新增/删除分类计数。
- * @param {string|null} output - git 标准输出。
- * @returns {{ branch?: string, detached?: boolean, oid?: string, ahead?: number, behind?: number, dirty?: boolean, files?: number, modified?: number, added?: number, deleted?: number }}
+ * Parse `status --porcelain=v2 --branch` output into modified/added/deleted counts.
+ * @param {string|null} output - git stdout.
+ * @returns {{ branch?: string, detached?: boolean, oid?: string, ahead?: number, behind?: number, dirty?: boolean, files?: number, modified?: number, added?: number, untracked?: number, deleted?: number }}
  */
 function parseStatus(output) {
   if (output === null) return {};
-  const result = { dirty: false, files: 0, modified: 0, added: 0, deleted: 0, ahead: 0, behind: 0 };
+  const result = { dirty: false, files: 0, modified: 0, added: 0, untracked: 0, deleted: 0, ahead: 0, behind: 0 };
   for (const line of output.split("\n")) {
     if (line.startsWith("# branch.head ")) {
       const value = line.slice("# branch.head ".length).trim();
@@ -73,11 +103,12 @@ function parseStatus(output) {
         result.behind = Number(match[2]);
       }
     } else if (line.startsWith("? ")) {
-      result.added += 1;
+      // Untracked paths are counted apart from staged/unstaged additions.
+      result.untracked += 1;
       result.files += 1;
       result.dirty = true;
     } else if (line.startsWith("1 ") || line.startsWith("2 ") || line.startsWith("u ")) {
-      // porcelain v2 普通变更行：`<type> <XY> ...`
+      // porcelain v2 change line: `<type> <XY> ...`
       const xy = line.slice(2, 4);
       if (xy.includes("A")) result.added += 1;
       else if (xy.includes("D")) result.deleted += 1;
@@ -90,29 +121,31 @@ function parseStatus(output) {
 }
 
 /**
- * 采集一个工作目录的仓库状态。
- * @param {string} cwd - 会话工作目录。
- * @returns {Promise<object>} 状态条需要的字段；不在仓库内时只回 cwd。
+ * Collect repository state for one working directory.
+ * @param {string} cwd - session working directory.
+ * @returns {Promise<object>} fields the status line needs; only cwd outside a repository.
  */
 async function collect(cwd) {
-  const top = await git(cwd, ["rev-parse", "--show-toplevel"]);
-  if (top === null || top === "") return { cwd, inRepo: false };
+  const toplevel = await git(cwd, ["rev-parse", "--show-toplevel"]);
+  // A missing or unresponsive git is not "not a repository": report it apart so the
+  // row can say what is actually wrong.
+  if (toplevel.failure === "git-missing" || toplevel.failure === "git-timeout") {
+    return { cwd, inRepo: false, unavailable: toplevel.failure };
+  }
+  if (toplevel.stdout === null || toplevel.stdout === "") return { cwd, inRepo: false };
+  const top = toplevel.stdout;
 
-  const [gitDir, commonDir, statusOut] = await Promise.all([
-    git(top, ["rev-parse", "--absolute-git-dir"]),
+  const [commonDir, statusOut] = await Promise.all([
     git(top, ["rev-parse", "--path-format=absolute", "--git-common-dir"]),
     git(top, ["--no-optional-locks", "status", "--porcelain=v2", "--branch", "--untracked-files=normal"]),
   ]);
 
-  const status = parseStatus(statusOut);
-  const normalizedGitDir = gitDir === null ? null : normalize(gitDir);
-  const normalizedCommonDir = commonDir === null ? null : normalize(commonDir);
-  // linked worktree：git 目录位于公共目录的 worktrees/<name> 下。
-  const linked =
-    normalizedGitDir !== null &&
-    normalizedCommonDir !== null &&
-    normalizedGitDir.toLowerCase() !== normalizedCommonDir.toLowerCase();
-  const worktree = linked ? basename(normalizedGitDir) : null;
+  const status = parseStatus(statusOut.stdout);
+  // A failed or truncated status must not be reported as a clean tree.
+  const statusUnavailable = statusOut.stdout === null ? statusOut.failure ?? "git-failed" : null;
+  const normalizedCommonDir = commonDir.stdout === null ? null : normalize(commonDir.stdout);
+  // The segment names the checkout directory, the way the user sees it on disk.
+  const worktree = top.length > 0 ? basename(normalize(top)) : null;
   const repo = normalizedCommonDir === null ? null : basename(dirname(normalizedCommonDir));
 
   return {
@@ -121,43 +154,54 @@ async function collect(cwd) {
     top,
     repo,
     worktree,
-    linked,
     branch: status.branch ?? null,
     detached: status.detached === true,
     oid: status.oid ?? null,
     ahead: status.ahead ?? 0,
     behind: status.behind ?? 0,
-    dirty: status.dirty === true,
+    statusUnavailable,
+    dirty: statusUnavailable === null && status.dirty === true,
     files: status.files ?? 0,
     modified: status.modified ?? 0,
     added: status.added ?? 0,
+    untracked: status.untracked ?? 0,
     deleted: status.deleted ?? 0,
   };
 }
 
 /**
- * 带短 TTL 的采集入口。
- * @param {string} cwd - 会话工作目录。
- * @returns {Promise<object>} 采集结果。
+ * Cache-fronted collector; concurrent callers for one cwd share a single run.
+ * @param {string} cwd - session working directory.
+ * @returns {Promise<object>} collected state.
  */
 async function collectCached(cwd) {
-  const now = Date.now();
   const hit = cache.get(cwd);
-  if (hit !== undefined && now - hit.at < CACHE_TTL_MS) return hit.value;
-  const value = await collect(cwd);
-  cache.set(cwd, { at: now, value });
-  if (cache.size > 64) {
-    for (const [key, entry] of cache) {
-      if (now - entry.at > CACHE_TTL_MS * 10) cache.delete(key);
-    }
-  }
-  return value;
+  if (hit !== undefined && Date.now() - hit.at < CACHE_TTL_MS) return hit.value;
+  const inflight = pending.get(cwd);
+  if (inflight !== undefined) return inflight;
+  const promise = collect(cwd)
+    .then((value) => {
+      // Timestamp after the work, so a slow run is not cached as already stale.
+      cache.set(cwd, { at: Date.now(), value });
+      if (cache.size > 64) {
+        const now = Date.now();
+        for (const [key, entry] of cache) {
+          if (now - entry.at > CACHE_TTL_MS * 10) cache.delete(key);
+        }
+      }
+      return value;
+    })
+    .finally(() => {
+      pending.delete(cwd);
+    });
+  pending.set(cwd, promise);
+  return promise;
 }
 
 /**
- * 输出 JSON 响应。
- * @param {unknown} body - 要序列化的内容。
- * @param {number} status - HTTP 状态码。
+ * Build a JSON response.
+ * @param {unknown} body - content to serialize.
+ * @param {number} status - HTTP status code.
  * @returns {Response}
  */
 function json(body, status = 200) {
@@ -171,8 +215,8 @@ function json(body, status = 200) {
 }
 
 /**
- * 安装 Host 侧精确路由。
- * @param {import("@deepseek-ai/cordis").Context} ctx - 插件上下文。
+ * Install the Host side: the exact routes the browser half calls.
+ * @param {import("@deepseek-ai/cordis").Context} ctx - plugin context.
  */
 export function apply(ctx) {
   ctx.effect(
@@ -184,7 +228,17 @@ export function apply(ctx) {
         fetch: async (request) => {
           const url = new URL(request.url);
           const cwd = url.searchParams.get("cwd");
-          if (cwd === null || cwd.length === 0 || cwd.length > 4096 || !isAbsolute(cwd)) {
+          // Reject UNC and device paths before git touches them: on Windows those
+          // send SMB/device requests the status line has no business making.
+          const unsafeWindowsPath = process.platform === "win32" && cwd !== null && cwd.startsWith("\\\\");
+          if (
+            cwd === null ||
+            cwd.length === 0 ||
+            cwd.length > 4096 ||
+            !isAbsolute(cwd) ||
+            unsafeWindowsPath ||
+            cwd.includes("\0")
+          ) {
             return json({ error: "invalid-cwd" }, 400);
           }
           try {
@@ -197,29 +251,28 @@ export function apply(ctx) {
     "statusline: git status route",
   );
 
-  // 渲染自检：浏览器半侧把状态条实际显示的文本回报到这里，
-  // 便于在不打开浏览器的情况下核对渲染结果。
-  ctx.effect(
-    () =>
-      ctx.connection.fetch.register({
-        path: "/api/statusline/report",
-        methods: ["POST"],
-        requestBody: "buffered",
-        fetch: async (request) => {
-          try {
-            const body = await request.text();
-            if (REPORT_PATH !== null && body.length > 0 && body.length <= 8192) {
-              appendFileSync(
-                REPORT_PATH,
-                new Date().toISOString() + " " + body + "\n",
-              );
+  // Render self-check route, registered only while the opt-in log is enabled.
+  if (REPORT_ENABLED) {
+    ctx.effect(
+      () =>
+        ctx.connection.fetch.register({
+          path: "/api/statusline/report",
+          methods: ["POST"],
+          requestBody: "buffered",
+          fetch: async (request) => {
+            try {
+              const body = await request.text();
+              if (body.length > 0 && body.length <= 8192 && reportLogHasRoom()) {
+                // One JSON line per report: the body cannot forge extra lines.
+                appendFileSync(REPORT_PATH, JSON.stringify({ at: new Date().toISOString(), body }) + "\n");
+              }
+            } catch {
+              // A failed self-check never affects the status line itself.
             }
-          } catch {
-            // 自检失败不影响状态条本身。
-          }
-          return new Response("ok");
-        },
-      }),
-    "statusline: render report route",
-  );
+            return new Response("ok");
+          },
+        }),
+      "statusline: render report route",
+    );
+  }
 }

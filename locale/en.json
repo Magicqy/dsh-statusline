@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Status line",
+    "description": "Adds one line at the bottom of the window with the active session's git state: branch (or short commit when detached), worktree, working directory, counts of modified, added, untracked and deleted files, and ahead/behind. It refreshes every three seconds with read-only git commands and shows \"not a git repository\" outside a repository, or \"git not found\" when git is missing. Requires git on PATH."
+  }
+}

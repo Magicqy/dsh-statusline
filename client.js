@@ -1,7 +1,7 @@
-// DSH statusline 的浏览器 half：占用布局框架的 `shell.bottom` 槽位，
-// 显示当前会话工作目录的 git 分支、worktree、脏标记、ahead/behind 与上下文占用。
-// 数据分两类：cwd 与上下文占用直接从客户端 sessions store 读取，
-// git 状态通过 Host 侧注册的 `/statusline/git` 精确路由轮询。
+// DSH statusline browser half: claims the layout's `shell.bottom` slot and shows
+// the active session's git branch, linked worktree, working directory, change
+// counts and ahead/behind. The cwd comes from the client sessions store; git
+// state is polled from the `/api/statusline/git` route the Host half registers.
 window.__ModuleLoader__.load({
   id: "dsh-statusline",
   factory: (require) => {
@@ -14,35 +14,18 @@ window.__ModuleLoader__.load({
     const jsx = jsxRuntime.jsx;
     const jsxs = jsxRuntime.jsxs;
 
-    /** 本插件拥有的 locale 命名空间。 */
-    const NS = "statusline";
-    /** 客户端依赖：槽位注册、会话 store 与词典。 */
-    const inject = ["slots", "sessions", "locale"];
-    /** git 状态轮询间隔。 */
+    /** Client dependencies: slot registration and the sessions store. */
+    const inject = ["slots", "sessions"];
+    /** Poll interval for git state. */
     const POLL_MS = 3000;
 
-    const zh = {
-      branch: "分支",
-      cwd: "目录",
-      ctx: "上下文",
-      worktree: "工作树",
-      detached: "游离",
-      dirty: "有未提交改动",
-      clean: "工作区干净",
-      noRepo: "非 git 仓库",
-    };
-    const en = {
-      branch: "branch",
-      cwd: "cwd",
-      ctx: "ctx",
-      worktree: "worktree",
-      detached: "detached",
-      dirty: "uncommitted changes",
-      clean: "clean working tree",
-      noRepo: "not a git repository",
-    };
+    /** Same-origin API URL, relative to the page so a prefixed deployment keeps working. */
+    function apiUrl(path) {
+      const base = typeof document !== "undefined" && document.baseURI ? document.baseURI : window.location.href;
+      return new URL("api/" + path, base).toString();
+    }
 
-    /** 帧内所有样式集中在这里，避免与宿主模块的 CSS Modules 交叉。 */
+    /** Every style this frame uses lives here, so it cannot collide with host CSS Modules. */
     const STYLES = {
       root: {
         display: "flex",
@@ -58,7 +41,6 @@ window.__ModuleLoader__.load({
         lineHeight: "26px",
         whiteSpace: "nowrap",
         overflow: "hidden",
-        userSelect: "none",
       },
       segment: {
         display: "inline-flex",
@@ -94,37 +76,49 @@ window.__ModuleLoader__.load({
     };
 
     /**
-     * 选当前主视图持有的会话：root 作用域没有 sessionId，按框架的
-     * `retainedBy.mainView` 计数找正在被主视图渲染的那个会话。
-     * @param {object} state - sessions store 快照。
-     * @returns {string|undefined} 会话 id。
+     * Pick the session the main view holds. The slot lives in the root scope, so
+     * prefer an explicit `sessionId` prop; otherwise count the framework's
+     * `retainedBy.mainView` references, then try the store's own active-id fields.
+     * Every step is optional: an unknown store shape returns undefined, not a throw.
+     * @param {object} state - sessions store snapshot.
+     * @param {string|undefined} preferred - session id supplied by the slot, if any.
+     * @returns {string|undefined} session id.
      */
-    function selectSessionId(state) {
-      if (!state || !state.byId) return undefined;
-      const ids = state.ids || [];
+    function selectSessionId(state, preferred) {
+      if (!state) return undefined;
+      const byId = state.byId;
+      if (!byId) return undefined;
+      if (typeof preferred === "string" && byId[preferred] !== undefined) return preferred;
+      const ids = Array.isArray(state.ids) ? state.ids : Object.keys(byId);
       for (const id of ids) {
-        const row = state.byId[id];
+        const row = byId[id];
         if (row && row.retainedBy && (row.retainedBy.mainView || 0) > 0) return id;
+      }
+      for (const key of ["activeSessionId", "selectedSessionId", "currentSessionId"]) {
+        const value = state[key];
+        if (typeof value === "string" && byId[value] !== undefined) return value;
       }
       return undefined;
     }
 
     /**
-     * 取路径最后一段，用于窄屏下的降级显示。
-     * @param {string} value - 绝对路径。
+     * Last path segment, used for the narrow layout.
+     * @param {string} value - absolute path.
      * @returns {string}
      */
     function lastSegment(value) {
       const trimmed = value.replace(/[\\/]+$/, "");
       const index = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
-      return index === -1 ? trimmed : trimmed.slice(index + 1);
+      const segment = index === -1 ? trimmed : trimmed.slice(index + 1);
+      // A filesystem root ("/", "C:\") has no last segment; show the path instead of nothing.
+      return segment.length > 0 ? segment : value;
     }
 
     /**
-     * 比较两个路径是否指向同一目录（忽略分隔符与大小写差异）。
-     * @param {unknown} a - 路径 A。
-     * @param {unknown} b - 路径 B。
-     * @returns {boolean} 是否相同。
+     * Whether two paths point at the same directory, ignoring separators and case.
+     * @param {unknown} a - path A.
+     * @param {unknown} b - path B.
+     * @returns {boolean}
      */
     function samePath(a, b) {
       if (typeof a !== "string" || typeof b !== "string") return false;
@@ -133,53 +127,62 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 渲染一个「标签 + 值」分段。
-     * @param {string} label - 标签文本。
-     * @param {string} value - 值文本。
-     * @param {object} valueStyle - 值样式。
-     * @param {string} title - 悬停提示。
-     * @returns {object} React 元素。
+     * Render one "label value" segment.
+     * @param {string} key - React key, independent of any localisation.
+     * @param {string} label - label text.
+     * @param {string} value - value text.
+     * @param {object} valueStyle - style for the value.
+     * @param {string} title - hover text.
+     * @param {object} [extraStyle] - extra layout style merged onto the segment.
+     * @returns {object} React element.
      */
-    function segment(label, value, valueStyle, title) {
+    function segment(key, label, value, valueStyle, title, extraStyle) {
       return jsxs(
         "span",
         {
-          style: STYLES.segment,
+          style: extraStyle ? { ...STYLES.segment, ...extraStyle } : STYLES.segment,
           title,
           children: [
             jsx("span", { style: STYLES.label, children: label }),
             jsx("span", { style: valueStyle, children: value }),
           ],
         },
-        label + ":" + value,
+        key,
       );
     }
 
     /**
-     * 状态条组件。props 由槽位渲染器组装：`useStatusSessions` 来自本插件
-     * 注册时注入的 sessions source，`t` 来自 locale 字典。
-     * @param {object} props - 槽位 props。
-     * @returns {object|null} 状态条元素；没有会话时不占位。
+     * Status bar component. Props are assembled by the slot renderer:
+     * `useStatusSessions` comes from the sessions source this plugin injects.
+     * @param {object} props - slot props.
+     * @returns {object|null} status bar element; null while there is no session.
      */
     function StatusBar(props) {
       const useStatusSessions = typeof props.useStatusSessions === "function" ? props.useStatusSessions : () => undefined;
-      const t = typeof props.t === "function" ? props.t : (key) => key;
 
-      const liveId = useStatusSessions(selectSessionId);
-      // 切换到全局面板（插件页、设置页）时主视图会让出会话，保留最后已知的会话，
-      // 避免状态条在该页面上突然消失。
+      const sessionIdProp = typeof props.sessionId === "string" && props.sessionId.length > 0 ? props.sessionId : undefined;
+      const liveId = useStatusSessions((state) => selectSessionId(state, sessionIdProp));
+      // Opening a global panel (plugins, settings) makes the main view release its
+      // session; keep the last known one so the bar does not vanish there.
       const lastIdRef = react.useRef(undefined);
-      if (liveId !== undefined) lastIdRef.current = liveId;
+      react.useEffect(() => {
+        if (liveId !== undefined) lastIdRef.current = liveId;
+      }, [liveId]);
       const sessionId = liveId !== undefined ? liveId : lastIdRef.current;
 
       const cwd = useStatusSessions((state) => {
         if (!state || sessionId === undefined) return undefined;
-        // 会话列表的 cwd 是创建时的原始目录（header.cwd）；working_directory
-        // 切换后的当前目录在 workingDirectory 会话投影里，优先读它。
+        // A later working_directory change lives in the workingDirectory projection;
+        // the row's own cwd is the directory the session was created in.
         const projected = state.projectionsBySession?.[sessionId]?.values?.workingDirectory;
         if (typeof projected === "string" && projected.length > 0) return projected;
         const row = state.byId ? state.byId[sessionId] : undefined;
-        return row ? row.cwd : undefined;
+        // Known spellings first, then older/newer placements of the same value.
+        const candidates = [row?.cwd, row?.header?.cwd, row?.meta?.cwd, row?.summary?.cwd];
+        for (const value of candidates) {
+          if (typeof value === "string" && value.length > 0) return value;
+        }
+        return undefined;
       });
       const [git, setGit] = react.useState(null);
 
@@ -190,27 +193,51 @@ window.__ModuleLoader__.load({
         }
         let cancelled = false;
         let timer = undefined;
+        let controller = null;
+        let inFlight = false;
+        let abortRequested = false;
         const load = async () => {
+          if (cancelled || inFlight) return;
+          inFlight = true;
+          abortRequested = false;
+          controller = typeof AbortController === "function" ? new AbortController() : null;
           try {
-            const response = await fetch("/api/statusline/git?cwd=" + encodeURIComponent(cwd), {
+            const response = await fetch(apiUrl("statusline/git?cwd=" + encodeURIComponent(cwd)), {
               credentials: "same-origin",
+              ...(controller === null ? {} : { signal: controller.signal }),
             });
             if (!response.ok) throw new Error("HTTP " + response.status);
             const data = await response.json();
-            if (!cancelled) setGit(data);
+            if (!cancelled && !abortRequested) setGit(data);
           } catch (error) {
-            if (!cancelled) setGit({ error: String(error) });
+            if (!cancelled && !abortRequested) setGit({ error: String(error) });
+          } finally {
+            inFlight = false;
+            controller = null;
+            // Schedule only once this run settled, so a slow request cannot stack
+            // up behind the interval, and stay quiet while the tab is hidden.
+            if (!cancelled && !abortRequested) {
+              timer = setTimeout(() => {
+                timer = undefined;
+                void load();
+              }, POLL_MS);
+            }
           }
         };
         const start = () => {
-          if (timer !== undefined) return;
+          if (inFlight || timer !== undefined) return;
           void load();
-          timer = setInterval(load, POLL_MS);
         };
         const stop = () => {
-          if (timer === undefined) return;
-          clearInterval(timer);
-          timer = undefined;
+          abortRequested = true;
+          if (timer !== undefined) {
+            clearTimeout(timer);
+            timer = undefined;
+          }
+          if (controller !== null) {
+            controller.abort();
+            controller = null;
+          }
         };
         const onVisibility = () => {
           if (document.hidden) stop();
@@ -225,104 +252,207 @@ window.__ModuleLoader__.load({
         };
       }, [cwd]);
 
-      // 渲染自检：渲染内容变化时把实际状态回报给 Host，便于离线核对
-      // 浏览器里真正显示的是什么（不依赖人工查看界面）。
+      // Render self-check: report what is actually shown to the Host when it
+      // changes, so the rendering can be checked without watching the window.
       const reportRef = react.useRef("");
-      const reportKey =
-        (cwd ?? "") +
-        "|" +
-        (git === null
-          ? "nil"
-          : [String(git.branch ?? ""), String(git.inRepo === true), String(git.dirty === true), String(git.files ?? 0)].join(":"));
+      const reportPayload = JSON.stringify({
+        sessionId,
+        cwd,
+        branch: git !== null && git.inRepo === true ? git.branch ?? null : null,
+        detached: git !== null ? git.detached === true : null,
+        inRepo: git !== null ? git.inRepo === true : null,
+        dirty: git !== null ? git.dirty === true : null,
+        files: git !== null ? git.files ?? 0 : null,
+        worktree: git !== null ? git.worktree ?? null : null,
+        untracked: git !== null ? git.untracked ?? null : null,
+        ahead: git !== null ? git.ahead ?? null : null,
+        behind: git !== null ? git.behind ?? null : null,
+        statusUnavailable: git !== null ? git.statusUnavailable ?? null : null,
+        unavailable: git !== null ? git.unavailable ?? null : null,
+      });
       react.useEffect(() => {
         if (typeof cwd !== "string" || cwd.length === 0) return;
-        const payload = JSON.stringify({
-          sessionId,
-          cwd,
-          branch: git !== null && git.inRepo === true ? git.branch ?? null : null,
-          detached: git !== null ? git.detached === true : null,
-          inRepo: git !== null ? git.inRepo === true : null,
-          dirty: git !== null ? git.dirty === true : null,
-          files: git !== null ? git.files ?? 0 : null,
-        });
-        if (payload === reportRef.current) return;
-        reportRef.current = payload;
-        void fetch("/api/statusline/report", {
+        if (reportPayload === reportRef.current) return;
+        reportRef.current = reportPayload;
+        void fetch(apiUrl("statusline/report"), {
           method: "POST",
           credentials: "same-origin",
-          body: payload,
+          body: reportPayload,
         }).catch(() => {});
-      }, [reportKey]);
+      }, [reportPayload]);
 
       if (typeof cwd !== "string" || cwd.length === 0) return null;
 
-      // 只有 git 结果对应的就是当前 cwd 时才采用，避免切换目录瞬间沿用上一个目录的数据。
+      // Use a git result only when it was fetched for this exact cwd, so switching
+      // directories cannot briefly show the previous directory's data.
       const ready = git !== null && samePath(git.cwd, cwd);
       const inRepo = ready && git.inRepo === true;
-      const branchText = !ready
-        ? "…"
-        : inRepo
-          ? git.detached === true
-            ? lastSegment(git.oid === null || git.oid === undefined ? "detached" : git.oid.slice(0, 7))
-            : String(git.branch ?? "?")
-          : t("noRepo");
+      // A failed `git status` is neither clean nor dirty; say so instead of showing 0.
+      const statusFailed = git !== null && typeof git.statusUnavailable === "string" ? git.statusUnavailable : null;
+      // Tell "still loading", "git is unusable" and "no repository" apart: a missing
+      // git or a dead route must not read as an empty session.
+      const unavailable = git !== null && typeof git.unavailable === "string" ? git.unavailable : null;
+      const failureText =
+        unavailable === "git-missing"
+          ? "git not found"
+          : unavailable === "git-timeout"
+            ? "git timed out"
+            : unavailable !== null
+              ? "git unavailable"
+              : git !== null && typeof git.error === "string"
+                ? "git unavailable"
+                : null;
+      const failureTitle =
+        failureText === null
+          ? null
+          : unavailable === "git-missing"
+            ? "`git` is not on PATH"
+            : unavailable === "git-timeout"
+              ? "`git` did not answer within 5 seconds"
+              : String(git.error ?? "the statusline route did not answer");
 
-      // 所有信息左对齐依次排列：br [· wt] · cwd · status [· ↑a↓b]
+      const branchText =
+        failureText ??
+        (!ready
+          ? "…"
+          : inRepo
+            ? git.detached === true
+              ? lastSegment(git.oid === null || git.oid === undefined ? "detached" : git.oid.slice(0, 7))
+              : String(git.branch ?? "?")
+            : "not a git repository");
+      const branchTitle =
+        failureTitle ??
+        (!ready
+          ? "…"
+          : inRepo
+            ? git.detached === true
+              ? "detached HEAD"
+              : String(git.branch ?? "?")
+            : "not a git repository");
+
+      // Everything is left aligned: branch · worktree · cwd · changes [· ↑a↓b]
       const parts = [];
       parts.push(
-        segment(
-          "branch",
-          branchText,
-          inRepo ? STYLES.value : STYLES.valueMuted,
-          inRepo ? git.branch ?? branchText : t("noRepo"),
-        ),
+        segment("branch", "branch", branchText, inRepo ? STYLES.value : STYLES.valueMuted, branchTitle),
       );
-      if (inRepo && git.worktree && lastSegment(cwd) !== String(git.worktree)) {
-        parts.push(segment("worktree", String(git.worktree), STYLES.value, t("worktree") + " " + git.top));
-      }
-      parts.push(segment("cwd", lastSegment(cwd), STYLES.valueMuted, cwd));
+      // The worktree segment is always present and names the checkout directory;
+      // the repository path sits in the tooltip.
+      const worktreeText = failureText !== null ? "-" : !ready ? "…" : inRepo ? String(git.worktree ?? "?") : "-";
+      const worktreeTitle =
+        failureTitle ??
+        (!ready ? "…" : inRepo ? String(git.top ?? "") : "not a git repository");
+      parts.push(
+        segment("worktree", "worktree", worktreeText, inRepo ? STYLES.value : STYLES.valueMuted, worktreeTitle),
+      );
+      parts.push(segment("cwd", "cwd", lastSegment(cwd), STYLES.valueMuted, cwd));
 
       {
-        // status 段常显占位：干净时显示 0，有改动时显示 *修改 +新增 -删除，
-        // 非仓库显示 -，未就绪显示 …，保证这个信息位始终存在。
+        // The changes segment always occupies its slot: 0 when clean, *modified
+        // +added ?untracked -deleted when dirty, - outside a repository, … before
+        // the first result.
         const counts = [];
         if (inRepo) {
           if (git.modified > 0) counts.push("*" + String(git.modified));
           if (git.added > 0) counts.push("+" + String(git.added));
+          if (git.untracked > 0) counts.push("?" + String(git.untracked));
           if (git.deleted > 0) counts.push("-" + String(git.deleted));
         }
         const changed = counts.length > 0;
+        const changesText =
+          failureText !== null
+            ? "-"
+            : statusFailed !== null
+              ? "?"
+              : !ready
+                ? "…"
+                : inRepo
+                  ? changed
+                    ? counts.join(" ")
+                    : "0"
+                  : "-";
+        const changesTitle =
+          failureTitle ??
+          (statusFailed !== null
+            ? "git status failed: " + statusFailed
+            : !ready
+              ? "…"
+              : inRepo
+                ? (changed ? "uncommitted changes" : "clean working tree") +
+                  " " +
+                  String(git.files ?? 0) +
+                  (git.files === 1 ? " path" : " paths")
+                : "not a git repository");
         parts.push(
           jsx(
             "span",
             {
-              style: changed ? STYLES.warn : STYLES.valueMuted,
-              title: !ready
-                ? "…"
-                : inRepo
-                  ? (changed ? t("dirty") : t("clean")) + " " + String(git.files ?? 0) + " 个文件"
-                  : t("noRepo"),
-              children: "changes " + (!ready ? "…" : inRepo ? (changed ? counts.join(" ") : "0") : "-"),
+              style: { ...(changed ? STYLES.warn : STYLES.valueMuted), flexShrink: 0, whiteSpace: "nowrap" },
+              title: changesTitle,
+              children: "changes " + changesText,
             },
             "changes",
           ),
         );
       }
       if (inRepo && (git.ahead > 0 || git.behind > 0)) {
+        const ahead = git.ahead ?? 0;
+        const behind = git.behind ?? 0;
         const ab = [];
-        if (git.ahead > 0) ab.push("↑" + String(git.ahead));
-        if (git.behind > 0) ab.push("↓" + String(git.behind));
-        parts.push(jsx("span", { style: STYLES.accent, children: ab.join(" ") }, "ahead-behind"));
+        if (ahead > 0) ab.push("↑" + String(ahead));
+        if (behind > 0) ab.push("↓" + String(behind));
+        const abTitle = String(ahead) + " ahead, " + String(behind) + " behind";
+        parts.push(
+          jsx(
+            "span",
+            {
+              style: { ...STYLES.accent, flexShrink: 0, whiteSpace: "nowrap" },
+              title: abTitle,
+              "aria-label": abTitle,
+              children: ab.join(" "),
+            },
+            "ahead-behind",
+          ),
+        );
       }
 
       const titleParts = [];
-      if (inRepo) {
-        titleParts.push(git.dirty === true ? t("dirty") : t("clean"));
+      if (failureTitle !== null) titleParts.push(failureTitle);
+      else if (inRepo) {
+        titleParts.push(git.dirty === true ? "uncommitted changes" : "clean working tree");
         if (git.branch) titleParts.push(git.branch);
         if (git.worktree) titleParts.push("worktree " + git.worktree);
         if (git.repo) titleParts.push("repo " + git.repo);
       }
       titleParts.push(cwd);
+
+      // One sentence for assistive tech; the row itself stays purely visual.
+      const accessibleLabel =
+        failureText !== null
+          ? "Git status unavailable: " + failureText
+          : statusFailed !== null
+            ? "Git status unavailable: git status failed"
+            : inRepo
+            ? "Git status: branch " +
+              branchText +
+              ", worktree " +
+              String(git.worktree ?? "") +
+              ", " +
+              String(git.modified ?? 0) +
+              " modified, " +
+              String(git.added ?? 0) +
+              " added, " +
+              String(git.untracked ?? 0) +
+              " untracked, " +
+              String(git.deleted ?? 0) +
+              " deleted" +
+              ((git.ahead ?? 0) > 0 || (git.behind ?? 0) > 0
+                ? ", " + String(git.ahead ?? 0) + " ahead, " + String(git.behind ?? 0) + " behind"
+                : "") +
+              ", at " +
+              cwd
+            : ready
+              ? "Git status: not a git repository, at " + cwd
+              : "Git status: loading";
 
       const rowChildren = [];
       parts.forEach((part, index) => {
@@ -335,6 +465,8 @@ window.__ModuleLoader__.load({
         {
           style: STYLES.root,
           "data-dsh-statusline": "root",
+          role: "group",
+          "aria-label": accessibleLabel,
           title: titleParts.join(" · "),
           children: rowChildren,
         },
@@ -343,11 +475,10 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * 安装浏览器半侧：注册词典，并把状态条挂到布局框架的底部槽位。
-     * @param {import("@deepseek-ai/cordis").Context} ctx - 客户端插件上下文。
+     * Install the browser half: mount the status bar into the layout's bottom slot.
+     * @param {import("@deepseek-ai/cordis").Context} ctx - client plugin context.
      */
     function apply(ctx) {
-      ctx.effect(() => ctx.locale.register(NS, { zh, en }), "statusline: dictionaries");
       const injectProps = () => ({
         hooks: { statusSessions: ctx.sessions.list },
       });
@@ -357,7 +488,6 @@ window.__ModuleLoader__.load({
             ctx.slots.register(
               {
                 name: "shell.bottom",
-                locale: NS,
                 inject: injectProps,
               },
               StatusBar,

@@ -1,20 +1,23 @@
 {
   "name": "dsh-statusline",
   "version": "0.1.0",
-  "description": "DSH 底部状态条：当前会话的分支、worktree、工作目录、未提交改动、ahead/behind 与上下文占用。A bottom status line for DeepSeek Harness.",
+  "description": "A bottom status line for DeepSeek Harness: git branch, worktree, working directory, modified / added / untracked / deleted counts and ahead/behind.",
   "type": "module",
   "main": "index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "client.js",
     "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
     "README.md",
-    "README.zh.md",
     "LICENSE"
   ],
   "keywords": [
@@ -24,25 +27,22 @@
     "statusline",
     "git"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Magicqy/dsh-statusline.git"
+  },
+  "homepage": "https://github.com/Magicqy/dsh-statusline#readme",
+  "bugs": {
+    "url": "https://github.com/Magicqy/dsh-statusline/issues"
+  },
   "license": "MIT",
+  "author": "Yong",
   "engines": {
     "dsh": ">=0.2.2-rc.1 <0.3.0"
   },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "plugin": {
-      "schemaVersion": 1,
-      "displayName": {
-        "en": "Status Line",
-        "zh-CN": "底部状态条"
-      },
-      "summary": {
-        "en": "Git branch, worktree, cwd, dirty state, ahead/behind and context usage in one line at the bottom of the window.",
-        "zh-CN": "把分支、工作树、工作目录、未提交改动、ahead/behind 与上下文占用压成窗口底部一行。"
-      },
-      "category": "ui"
     },
     "client": {
       "platform": "web",
